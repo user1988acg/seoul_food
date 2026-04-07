@@ -2,143 +2,119 @@ import streamlit as st
 from streamlit_js_eval import get_geolocation
 import requests
 import pandas as pd
-from pyproj import Transformer
 import folium
 from streamlit_folium import st_folium
-import time
 
-# 页面配置
-st.set_page_config(page_title="2026 地道美食雷达", layout="wide")
-
-# 1. 密钥管理 (请确保 Secrets 中有这四个键)
-# Naver Search API (用于找店)
-# 搜索 API
+# 1. 密钥
 S_ID = st.secrets["SEARCH_ID"]
 S_SECRET = st.secrets["SEARCH_SECRET"]
-
-# 路径/地图 API
 NCP_ID = st.secrets["MAP_ID"]
 NCP_SECRET = st.secrets["MAP_SECRET"]
-# 2. 坐标转换工具
-to_naver = Transformer.from_crs("epsg:4326", "epsg:5179", always_xy=True)
-to_wgs84 = Transformer.from_crs("epsg:5179", "epsg:4326", always_xy=True)
 
-# 3. 搜索附近美食
-@st.cache_data(ttl=600)
-def search_nearby_food(lat, lon):
-    # 第一步：逆地理编码，把经纬度转成“街道名”，搜索才准
-    # 这里简化处理：直接搜索关键词，Naver 搜索 API 会优先匹配相关度
+test_url = "https://naveropenapi.apigw.ntruss.com/map-reversegeocode/v2/gc"
+test_headers = {"X-NCP-APIGW-API-KEY-ID": NCP_ID, "X-NCP-APIGW-API-KEY": NCP_SECRET}
+test_res = requests.get(test_url, headers=test_headers, params={"coords": "127.0,37.0", "output": "json"})
+
+if test_res.status_code == 401:
+    st.error("🚨 权限诊断结果：您的 NCP Key 仍然没有权限！")
+    st.write("请检查：1. 是否点击了 'Maps 服务使用申请'。 2. 是否在 Application 里勾选了权限。 3. 是否等待了 15 分钟。")
+elif test_res.status_code == 200:
+    st.success("✅ 权限诊断结果：NCP Key 已激活！水原店即将出现。")
+
+# 获取行政区 (如: 水原市)
+def get_current_district(lat, lon):
+    url = "https://naveropenapi.apigw.ntruss.com/map-reversegeocode/v2/gc"
+    headers = {"X-NCP-APIGW-API-KEY-ID": NCP_ID, "X-NCP-APIGW-API-KEY": NCP_SECRET}
+    params = {"coords": f"{lon},{lat}", "output": "json", "orders": "admcode"}
+    try:
+        res = requests.get(url, headers=headers, params=params)
+        if res.status_code != 200:
+            st.error(f"⚠️ 无法获取行政区 (ErrorCode: {res.status_code})")
+            st.write(res.text) # 这里会显示是否欠费或没开权限
+            return None
+        data = res.json()
+        city = data['results'][0]['region']['area2']['name']
+        return city
+    except:
+        return None
+
+# 搜索
+def search_nearby_food(lat, lon, district_name):
     url = "https://openapi.naver.com/v1/search/local.json"
     headers = {"X-Naver-Client-Id": S_ID, "X-Naver-Client-Secret": S_SECRET}
     
-    # 模拟“地道搜索”：搜一些韩国人爱用但游客少用的词
-    params = {
-        "query": "현지인 맛집", # “当地人美食店”
-        "display": 15,
-        "sort": "comment"
-    }
+    # 逻辑加固：如果没拿到地名，绝不去搜全韩国，而是报错提醒
+    if not district_name:
+        st.warning("⚠️ 由于权限问题没拿到当前城市名，请手动输入城市进行搜索。")
+        district_name = st.text_input("请输入您所在的城市(如: 수원시)", "수원시")
     
+    query = f"{district_name} 맛집"
+    params = {"query": query, "display": 15, "sort": "comment"}
     res = requests.get(url, headers=headers, params=params)
-    if res.status_code == 200:
-        return res.json().get('items', [])
-    return []
+    return res.json().get('items', [])
 
-# 4. 获取路径规划数据
+# 路径
 def get_route_data(start_lon, start_lat, goal_lon, goal_lat):
     url = "https://naveropenapi.apigw.ntruss.com/map-direction/v1/driving"
     headers = {"X-NCP-APIGW-API-KEY-ID": NCP_ID, "X-NCP-APIGW-API-KEY": NCP_SECRET}
-    params = {
-        "start": f"{start_lon},{start_lat}",
-        "goal": f"{goal_lon},{goal_lat}",
-        "option": "trafast"
-    }
+    params = {"start": f"{start_lon},{start_lat}", "goal": f"{goal_lon},{goal_lat}", "option": "trafast"}
     res = requests.get(url, headers=headers, params=params)
     return res.json()
 
-# 5. 渲染 Folium 网页内地图
-def render_route_map(route_json):
-    path = route_json['route']['trafast'][0]['path']
-    path_points = [[p[1], p[0]] for p in path] # 转为 lat, lon
-    
-    m = folium.Map(location=path_points[len(path_points)//2], zoom_start=15)
-    folium.PolyLine(path_points, color="red", weight=5, opacity=0.7).add_to(m)
-    folium.Marker(path_points[0], popup="起点").add_to(m)
-    folium.Marker(path_points[-1], popup="终点").add_to(m)
-    return m
-
 # ==========================================
-# 主界面逻辑
+# 主界面
 # ==========================================
-st.title("🇰🇷 2026 周边“地道盲区”美食雷达")
+st.title("🇰🇷 2026 韩国地道美食雷达")
 
-# 初始化 session_state
-if 'paid_list' not in st.session_state:
-    st.session_state.paid_list = []
+if 'paid_list' not in st.session_state: st.session_state.paid_list = []
 
 location = get_geolocation()
-if location or st.checkbox("调试模式 (圣水洞)"):
-    u_lat, u_lon = (location['coords']['latitude'], location['coords']['longitude']) if location else (37.544, 127.056)
-    
-    st.success(f"📍 当前定位：经度 {u_lon:.4f}, 纬度 {u_lat:.4f}")
+debug_mode = st.checkbox("调试模式 (强制定位到水原站)")
 
-    # 搜索
-    items = search_nearby_food(u_lat, u_lon)
+if location or debug_mode:
+    u_lat, u_lon = (location['coords']['latitude'], location['coords']['longitude']) if not debug_mode else (37.266, 127.000)
     
-    processed_gems = []
+    # 权限检查与地名获取
+    district = get_current_district(u_lat, u_lon)
+    
+    if district:
+        st.success(f"📍 您当前位于：{district}")
+    
+    items = search_nearby_food(u_lat, u_lon, district)
+    processed = []
     for item in items:
-        # 坐标转换：Naver Search 返回的是 TM128 格式，必须转回 WGS84 才能在地图显示
-        # 修正：Naver 的 mapx/mapy 需要除以 1e7 或者使用特定的 Transformer
         try:
-            # 这是一个常见的 Naver 坐标转换 trick
-            lon_wgs, lat_wgs = to_wgs84.transform(float(item['mapx']), float(item['mapy']))
-            processed_gems.append({
+            processed.append({
                 "name": item['title'].replace("<b>","").replace("</b>",""),
-                "address": item['address'],
-                "category": item['category'],
-                "lat": lat_wgs,
-                "lon": lon_wgs
+                "lat": float(item['mapy']) / 10000000,
+                "lon": float(item['mapx']) / 10000000,
+                "addr": item['address']
             })
         except: continue
 
-    if processed_gems:
-        df = pd.DataFrame(processed_gems)
-        st.map(df) # 先显示一个总览大图
+    if processed:
+        # 主地图
+        m = folium.Map(location=[u_lat, u_lon], zoom_start=14)
+        folium.Marker([u_lat, u_lon], icon=folium.Icon(color='blue')).add_to(m)
+        for p in processed:
+            folium.Marker([p['lat'], p['lon']], icon=folium.Icon(color='red')).add_to(m)
+        st_folium(m, width="100%", height=400, key="main")
 
-        st.subheader("🔎 发现的宝藏点")
-        for i, gem in enumerate(processed_gems):
-            with st.expander(f"💎 {gem['name']} ({gem['category']})"):
-                st.write(f"🏠 地址: {gem['address']}")
-                
-                # 状态判断
-                is_paid = f"paid_{i}" in st.session_state.paid_list
-                
-                if not is_paid:
-                    if st.button(f"解锁中文导航 (¥5)", key=f"pay_{i}"):
-                        st.warning("请扫码支付")
-                        st.image("https://your-website.com/qr.png", width=200)
-                        if st.button("我已完成支付", key=f"confirm_{i}"):
-                            st.session_state.paid_list.append(f"paid_{i}")
-                            st.rerun()
+        # 列表
+        for i, p in enumerate(processed):
+            with st.expander(f"💎 {p['name']}"):
+                if f"paid_{i}" not in st.session_state.paid_list:
+                    if st.button(f"解锁导航", key=f"p_{i}"):
+                        st.session_state.paid_list.append(f"paid_{i}")
+                        st.rerun()
                 else:
-                    # --- 支付成功：直接在网页内显示地图和路径 ---
-                    st.success("✅ 支付成功，已解锁实时路径")
-                    
-                    route_data = get_route_data(u_lon, u_lat, gem['lon'], gem['lat'])
-                    if route_data.get('code') == 0:
-                        c1, c2 = st.columns([2, 1])
-                        with c1:
-                            m = render_route_map(route_data)
-                            st_folium(m, width=600, height=400, key=f"map_{i}")
-                        with c2:
-                            st.write("### 🚶 中文步骤")
-                            summary = route_data['route']['trafast'][0]['summary']
-                            st.write(f"全程: {summary['distance']/1000:.1f}km")
-                            
-                            guides = route_data['route']['trafast'][0]['guide']
-                            for g in guides[:5]: # 显示前5步
-                                msg = g['instructions'].replace("우회전","右转").replace("좌회전","左转").replace("직진","直行")
-                                st.write(f"- {msg}")
+                    # 导航
+                    res = get_route_data(u_lon, u_lat, p['lon'], p['lat'])
+                    if res.get('code') == 0:
+                        path = res['route']['trafast'][0]['path']
+                        points = [[pt[1], pt[0]] for pt in path]
+                        rm = folium.Map(location=points[0], zoom_start=15)
+                        folium.PolyLine(points, color="red").add_to(rm)
+                        st_folium(rm, width=600, height=300, key=f"m_{i}")
                     else:
-                        st.error("路径计算失败，请检查 API 权限")
-else:
-    st.info("请允许位置权限以扫描周边。")
+                        st.error(f"导航失败: {res.get('message')}")
